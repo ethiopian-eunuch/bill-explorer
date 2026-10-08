@@ -1,0 +1,185 @@
+import os
+import re
+from typing import Any, Dict, List, Optional
+
+import requests
+
+
+class CongressGovClient:
+    BASE_URL = "https://api.congress.gov/v3"
+
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key or os.environ.get("CONGRESS_API_KEY")
+        if not self.api_key:
+            raise ValueError(
+                "No Congress.gov API key found. Set CONGRESS_API_KEY in your environment or .env file."
+            )
+
+    def _headers(self) -> Dict[str, str]:
+        return {"X-API-Key": self.api_key, "Accept": "application/json"}
+
+    def _request(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        url = f"{self.BASE_URL}{path}"
+        response = requests.get(url, headers=self._headers(), params=params, timeout=30)
+        if response.status_code == 429:
+            raise RuntimeError("Congress.gov API rate limit reached. Please retry later.")
+        if response.status_code >= 400:
+            raise RuntimeError(f"Congress.gov request failed with status {response.status_code}: {response.text[:300]}")
+        return response.json()
+
+    def _normalize_text(self, value: Any) -> str:
+        if value is None:
+            return "Not available"
+        if isinstance(value, list):
+            text = ", ".join(str(v) for v in value if v)
+            return text or "Not available"
+        if isinstance(value, dict):
+            return value.get("text") or value.get("name") or value.get("title") or str(value)
+        return str(value)
+
+    def _extract_name(self, item: Dict[str, Any]) -> str:
+        if not isinstance(item, dict):
+            return str(item)
+        return item.get("name") or item.get("fullName") or item.get("bioguideId") or item.get("title") or "Unknown"
+
+    def _extract_summary(self, detail: Dict[str, Any]) -> str:
+        candidates = [
+            detail.get("summary"),
+            detail.get("description"),
+            detail.get("text"),
+        ]
+
+        if isinstance(detail.get("summaries"), list) and detail["summaries"]:
+            for entry in detail["summaries"]:
+                if isinstance(entry, dict):
+                    candidates.append(entry.get("text"))
+                    candidates.append(entry.get("summary"))
+
+        for candidate in candidates:
+            if candidate:
+                if isinstance(candidate, list):
+                    joined = "\n".join(str(x) for x in candidate if x)
+                    if joined:
+                        return joined
+                if isinstance(candidate, dict):
+                    text = candidate.get("text") or candidate.get("summary")
+                    if text:
+                        return str(text)
+                if isinstance(candidate, str):
+                    return candidate
+        return "No summary available."
+
+    def _extract_committee(self, detail: Dict[str, Any]) -> str:
+        committees = detail.get("committees") or []
+        if isinstance(committees, list):
+            names = []
+            for item in committees:
+                if isinstance(item, dict):
+                    names.append(item.get("name") or item.get("committee") or item.get("title") or "Unknown")
+            if names:
+                return ", ".join(names)
+        return "Not specified"
+
+    def _extract_sponsors(self, detail: Dict[str, Any]) -> List[str]:
+        sponsors = detail.get("sponsors") or []
+        clean = []
+        for item in sponsors:
+            if isinstance(item, dict):
+                name = self._extract_name(item)
+                if name and name not in clean:
+                    clean.append(name)
+        return clean
+
+    def _extract_cosponsors(self, detail: Dict[str, Any]) -> List[str]:
+        cosponsors = detail.get("cosponsors") or []
+        clean = []
+        for item in cosponsors:
+            if isinstance(item, dict):
+                name = self._extract_name(item)
+                if name and name not in clean:
+                    clean.append(name)
+        return clean
+
+    def _extract_status(self, detail: Dict[str, Any]) -> str:
+        latest = detail.get("latestAction") or {}
+        if isinstance(latest, dict):
+            text = latest.get("text") or latest.get("actionType")
+            if text:
+                return str(text)
+        return detail.get("status") or "Unknown"
+
+    def _get_bill_detail(self, congress: str, bill_type: str, number: str) -> Dict[str, Any]:
+        path = f"/bill/{congress}/{bill_type}/{number}"
+        data = self._request(path)
+        return data.get("bill", data)
+
+    def _get_bill_text(self, congress: str, bill_type: str, number: str) -> str:
+        path = f"/bill/{congress}/{bill_type}/{number}/text"
+        data = self._request(path)
+        results = data.get("text", [])
+        if isinstance(results, list) and results:
+            first = results[0]
+            if isinstance(first, dict):
+                url = first.get("url") or first.get("download") or ""
+                if url:
+                    return url
+        return "Text URL unavailable"
+
+    def search_bills(
+        self,
+        query: Optional[str] = None,
+        congress: Optional[str] = None,
+        bill_type: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        params = {"limit": limit, "offset": offset}
+        if query:
+            params["q"] = query
+        if congress:
+            params["congress"] = congress
+        if bill_type:
+            params["billType"] = bill_type
+        if status:
+            params["status"] = status
+
+        data = self._request("/bill", params)
+        items = data.get("bills") or data.get("results") or []
+        results = []
+
+        for item in items:
+            congress_value = str(item.get("congress") or congress or "")
+            bill_type_value = str(item.get("billType") or bill_type or "")
+            number_value = str(item.get("number") or "")
+
+            if not congress_value or not bill_type_value or not number_value:
+                continue
+
+            detail = self._get_bill_detail(congress_value, bill_type_value, number_value)
+            text_url = self._get_bill_text(congress_value, bill_type_value, number_value)
+
+            bill = {
+                "bill_id": item.get("billId") or f"{congress_value}-{bill_type_value}-{number_value}",
+                "congress": congress_value,
+                "bill_type": bill_type_value,
+                "number": number_value,
+                "title": item.get("title") or item.get("officialTitle") or detail.get("title") or "Untitled Bill",
+                "status": self._extract_status(detail),
+                "sponsors": self._extract_sponsors(detail),
+                "cosponsors": self._extract_cosponsors(detail),
+                "summary": self._extract_summary(detail),
+                "committee": self._extract_committee(detail),
+                "text_url": text_url,
+                "latest_action": detail.get("latestAction", {}).get("text") if isinstance(detail.get("latestAction"), dict) else None,
+                "search_text": query,
+            }
+            results.append(bill)
+
+        return results
+
+
+if __name__ == "__main__":
+    client = CongressGovClient()
+    for bill in client.search_bills(query="climate", congress="118", limit=3):
+        print(bill["title"]) 
